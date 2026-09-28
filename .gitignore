@@ -32,3 +32,6 @@ vector_store/
 
 # Logs
 *.log
+# Academic source files — kept locally, not stored in Git
+data/**/*.pdf
+data/**/*.pptx
