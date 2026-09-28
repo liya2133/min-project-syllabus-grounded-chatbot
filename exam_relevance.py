@@ -1,90 +1,71 @@
 import sqlite3
-import re
 
-DB_PATH = "db/chatbot.db"
-
-
-# ============================================================
-# STOP WORDS
-# ============================================================
-
-STOP_WORDS = {
-    "what",
-    "is",
-    "are",
-    "the",
-    "a",
-    "an",
-    "explain",
-    "describe",
-    "discuss",
-    "define",
-    "give",
-    "with",
-    "and",
-    "of",
-    "in",
-    "on",
-    "for",
-    "to",
-    "how",
-    "why",
-    "can",
-    "you",
-    "me",
-    "about",
-    "tell",
-    "does",
-    "do",
-    "please",
-    "different",
-    "types",
-}
+from retrieve import DB_PATH
 
 
 # ============================================================
-# GET KEYWORDS
+# GET EXAM RELEVANCE
 # ============================================================
 
-def get_keywords(text):
+def get_exam_relevance(question, subject_id=None):
+    """
+    Find previous-year questions related to the student's
+    question.
 
-    words = re.findall(
-        r"[a-zA-Z]+",
-        text.lower()
-    )
+    If subject_id is provided, only PYQs belonging to that
+    subject are considered.
 
-    keywords = []
+    PYQ subject is determined through:
 
-    for word in words:
+        pyq_questions
+              ↓ document_id
+        documents
+              ↓ subject_id
+        subjects
+    """
 
-        if word in STOP_WORDS:
-            continue
+    # --------------------------------------------------------
+    # Convert question into useful keywords
+    # --------------------------------------------------------
 
-        if len(word) <= 2:
-            continue
+    keywords = question.lower().strip().split()
 
-        keywords.append(word)
+    stop_words = {
+        "what",
+        "is",
+        "are",
+        "the",
+        "a",
+        "an",
+        "of",
+        "in",
+        "on",
+        "for",
+        "to",
+        "and",
+        "explain",
+        "define",
+        "describe",
+        "give",
+        "with",
+        "about",
+        "how",
+        "why",
+        "difference",
+        "between"
+    }
 
-    return keywords
+    keywords = [
+        word
+        for word in keywords
+        if word not in stop_words
+    ]
 
-
-# ============================================================
-# EXAM RELEVANCE
-# ============================================================
-
-def get_exam_relevance(topic):
-
-    connection = sqlite3.connect(
-        DB_PATH
-    )
-
-    keywords = get_keywords(
-        topic
-    )
+    # --------------------------------------------------------
+    # No useful keywords
+    # --------------------------------------------------------
 
     if not keywords:
-
-        connection.close()
 
         return {
             "found": False,
@@ -92,130 +73,184 @@ def get_exam_relevance(topic):
             "questions": []
         }
 
-
     # --------------------------------------------------------
-    # Search every keyword
+    # Build phrase
     # --------------------------------------------------------
 
-    conditions = []
+    phrase = " ".join(keywords)
 
-    parameters = []
+    connection = sqlite3.connect(DB_PATH)
 
-    for keyword in keywords:
+    connection.row_factory = sqlite3.Row
 
-        conditions.append(
-            "LOWER(question_text) LIKE ?"
+    # ========================================================
+    # STEP 1
+    # Search exact phrase
+    # ========================================================
+
+    if subject_id is not None:
+
+        cursor = connection.execute(
+            """
+            SELECT
+                pq.question_number,
+                pq.part,
+                pq.module,
+                pq.question_text,
+                pq.year,
+                pq.marks,
+                pq.or_group
+            FROM pyq_questions AS pq
+            JOIN documents AS d
+                ON pq.document_id = d.id
+            WHERE LOWER(pq.question_text) LIKE ?
+              AND d.subject_id = ?
+            """,
+            (
+                f"%{phrase}%",
+                subject_id
+            )
         )
 
-        parameters.append(
-            f"%{keyword}%"
+    else:
+
+        cursor = connection.execute(
+            """
+            SELECT
+                pq.question_number,
+                pq.part,
+                pq.module,
+                pq.question_text,
+                pq.year,
+                pq.marks,
+                pq.or_group
+            FROM pyq_questions AS pq
+            WHERE LOWER(pq.question_text) LIKE ?
+            """,
+            (
+                f"%{phrase}%",
+            )
         )
 
+    rows = cursor.fetchall()
 
-    query = f"""
-        SELECT
-            question_number,
-            module,
-            question_text,
-            year,
-            marks
-        FROM pyq_questions
-        WHERE {" OR ".join(conditions)}
-        ORDER BY year DESC,
-                 question_number
-    """
+    # ========================================================
+    # STEP 2
+    # If exact phrase not found,
+    # search using ALL keywords
+    # ========================================================
 
+    if not rows and len(keywords) > 1:
 
-    rows = connection.execute(
-        query,
-        parameters
-    ).fetchall()
+        conditions = []
 
+        parameters = []
+
+        for keyword in keywords:
+
+            conditions.append(
+                "LOWER(pq.question_text) LIKE ?"
+            )
+
+            parameters.append(
+                f"%{keyword}%"
+            )
+
+        where_clause = " AND ".join(
+            conditions
+        )
+
+        if subject_id is not None:
+
+            query = f"""
+                SELECT
+                    pq.question_number,
+                    pq.part,
+                    pq.module,
+                    pq.question_text,
+                    pq.year,
+                    pq.marks,
+                    pq.or_group
+                FROM pyq_questions AS pq
+                JOIN documents AS d
+                    ON pq.document_id = d.id
+                WHERE {where_clause}
+                  AND d.subject_id = ?
+            """
+
+            parameters.append(subject_id)
+
+        else:
+
+            query = f"""
+                SELECT
+                    pq.question_number,
+                    pq.part,
+                    pq.module,
+                    pq.question_text,
+                    pq.year,
+                    pq.marks,
+                    pq.or_group
+                FROM pyq_questions AS pq
+                WHERE {where_clause}
+            """
+
+        rows = connection.execute(
+            query,
+            parameters
+        ).fetchall()
+
+    # --------------------------------------------------------
+    # Close database
+    # --------------------------------------------------------
 
     connection.close()
 
-
-    # --------------------------------------------------------
-    # Remove duplicate questions
-    # --------------------------------------------------------
-
-    unique_questions = {}
-
-    for row in rows:
-
-        question_number = row[0]
-
-        unique_questions[
-            question_number
-        ] = row
-
-
-    # --------------------------------------------------------
-    # Convert to dictionaries
-    # --------------------------------------------------------
+    # ========================================================
+    # Convert rows into dictionaries
+    # ========================================================
 
     questions = []
 
-    for row in unique_questions.values():
+    seen = set()
 
-        questions.append(
-            {
-                "question_number": row[0],
-                "module": row[1],
-                "question_text": row[2],
-                "year": row[3],
-                "marks": row[4]
-            }
+    for row in rows:
+
+        question_data = {
+            "question_number": row["question_number"],
+            "part": row["part"],
+            "module": row["module"],
+            "question_text": row["question_text"],
+            "year": row["year"],
+            "marks": row["marks"],
+            "or_group": row["or_group"]
+        }
+
+        # ----------------------------------------------------
+        # Remove duplicates
+        # ----------------------------------------------------
+
+        unique_key = (
+            question_data["year"],
+            question_data["question_number"],
+            question_data["question_text"]
         )
 
+        if unique_key in seen:
+            continue
+
+        seen.add(unique_key)
+
+        questions.append(
+            question_data
+        )
+
+    # ========================================================
+    # Return result
+    # ========================================================
 
     return {
         "found": len(questions) > 0,
         "count": len(questions),
         "questions": questions
     }
-
-
-# ============================================================
-# TESTING
-# ============================================================
-
-if __name__ == "__main__":
-
-    topic = input(
-        "Enter topic: "
-    )
-
-    result = get_exam_relevance(
-        topic
-    )
-
-    print("\n--- EXAM RELEVANCE ---")
-
-    if not result["found"]:
-
-        print(
-            "No matching PYQ found."
-        )
-
-    else:
-
-        print(
-            f"Found {result['count']} "
-            f"matching question(s).\n"
-        )
-
-        for question in result["questions"]:
-
-            print(
-                f"Q{question['question_number']} "
-                f"| Module: {question['module']} "
-                f"| Year: {question['year']} "
-                f"| Marks: {question['marks']}"
-            )
-
-            print(
-                question["question_text"]
-            )
-
-            print()

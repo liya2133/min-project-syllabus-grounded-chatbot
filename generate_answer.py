@@ -1,5 +1,6 @@
 """
 generate_answer.py
+
 ------------------
 
 Block 3: Answer Generation
@@ -7,12 +8,15 @@ Block 3: Answer Generation
 Flow:
 
 1. Take student's question.
-2. Retrieve relevant syllabus/notes chunks using FAISS.
-3. Find matching previous-year questions.
-4. Send the retrieved context to Gemini.
-5. Generate a syllabus-grounded answer.
-6. Show exam relevance.
-7. Log the query in SQLite.
+2. Take selected subject_id.
+3. Retrieve relevant syllabus/notes chunks using FAISS.
+4. Filter retrieval by subject_id when provided.
+5. Find matching previous-year questions.
+6. Send the retrieved context to Gemini.
+7. Generate a syllabus-grounded answer.
+8. Return exam relevance separately.
+9. Return sources separately.
+10. Log the query in SQLite.
 """
 
 import os
@@ -138,8 +142,8 @@ def call_llm(prompt):
        Retry up to 3 times.
 
     2. 429 - quota exceeded
-       Do NOT retry because the daily quota
-       has already been exhausted.
+       Do NOT retry because the quota has
+       already been exhausted.
 
     3. Other errors
        Raise the original error.
@@ -229,7 +233,6 @@ def call_llm(prompt):
             # =================================================
 
             else:
-
                 raise
 
 
@@ -289,9 +292,23 @@ def log_query(
 # ANSWER QUESTION
 # ============================================================
 
-def answer_question(question):
+def answer_question(question, subject_id=None):
     """
     Main chatbot function.
+
+    question:
+        Student's question.
+
+    subject_id:
+        ID of the selected subject.
+
+        Example:
+            1 = DSML
+            2 = Cloud Computing
+            etc.
+
+        If subject_id is None, retrieval is not
+        restricted to a particular subject.
     """
 
     # --------------------------------------------------------
@@ -299,11 +316,11 @@ def answer_question(question):
     # --------------------------------------------------------
 
     retrieval_result = retrieve(
-        question
+        question,
+        subject_id=subject_id
     )
 
     chunks = retrieval_result["chunks"]
-
 
     # --------------------------------------------------------
     # STEP 2: Check exam relevance
@@ -312,7 +329,6 @@ def answer_question(question):
     exam_result = get_exam_relevance(
         question
     )
-
 
     # --------------------------------------------------------
     # STEP 3: If topic is not covered
@@ -331,23 +347,19 @@ def answer_question(question):
 
         return {
             "answer": answer,
-            "exam_relevance": exam_result
+            "exam_relevance": exam_result,
+            "sources": []
         }
-
 
     # --------------------------------------------------------
     # STEP 4: Build syllabus context
     # --------------------------------------------------------
 
     # Only send the top 5 chunks to Gemini.
-    #
-    # This keeps the prompt smaller and
-    # reduces unnecessary processing.
 
     syllabus_context = build_context(
         chunks[:5]
     )
-
 
     # --------------------------------------------------------
     # STEP 5: Build PYQ context
@@ -357,12 +369,12 @@ def answer_question(question):
         exam_result
     )
 
-
     # --------------------------------------------------------
     # STEP 6: Build Gemini prompt
     # --------------------------------------------------------
 
     prompt = f"""
+
 You are a syllabus-grounded academic chatbot
 for MCA students.
 
@@ -371,10 +383,12 @@ The student asked:
 {question}
 
 
+
 You have two types of information:
 
 1. SYLLABUS / NOTES
 2. PREVIOUS YEAR QUESTIONS (PYQs)
+
 
 
 IMPORTANT RULES:
@@ -397,18 +411,18 @@ IMPORTANT RULES:
 - Do not use PYQs as factual source material
   for explaining the topic.
 
-- If matching PYQs are available, mention them
-  separately under "Exam Relevance".
-
 - Do not claim that a topic is important merely
   because it appeared in one PYQ.
-
-- Clearly separate the answer from PYQ evidence.
 
 - If the provided syllabus/notes do not contain
   enough information to explain something,
   clearly say that the available material does
   not provide further details.
+
+- Do NOT include Exam Relevance in your answer.
+
+- Do NOT include Sources in your answer.
+
 
 
 --------------------------------------------------
@@ -418,11 +432,13 @@ SYLLABUS / NOTES
 {syllabus_context}
 
 
+
 --------------------------------------------------
 PREVIOUS YEAR QUESTIONS
 --------------------------------------------------
 
 {pyq_context}
+
 
 
 --------------------------------------------------
@@ -432,31 +448,15 @@ RESPONSE FORMAT
 Answer:
 
 [Answer the student's question using only
-the syllabus/notes. Keep it simple.]
+the syllabus/notes.
 
+Keep it simple and clear.
 
-Exam Relevance:
+Do NOT include Exam Relevance.
 
-[If matching PYQs were found, mention:
+Do NOT include Sources.]
 
-- Matching PYQ found: Yes
-- Module
-- Year
-- Marks
-- Previous question
-
-If no matching PYQ was found, say:
-
-"No matching PYQ was found in the available
-PYQ database."]
-
-
-Sources:
-
-[List the syllabus/notes filename
-and page number.]
 """
-
 
     # --------------------------------------------------------
     # STEP 7: Ask Gemini
@@ -466,9 +466,24 @@ and page number.]
         prompt
     )
 
+    # --------------------------------------------------------
+    # STEP 8: Build source list
+    # --------------------------------------------------------
+
+    sources = []
+
+    for chunk in chunks[:5]:
+
+        source = {
+            "filename": chunk["filename"],
+            "page_number": chunk["page_number"]
+        }
+
+        if source not in sources:
+            sources.append(source)
 
     # --------------------------------------------------------
-    # STEP 8: Calculate confidence
+    # STEP 9: Calculate confidence
     # --------------------------------------------------------
 
     semantic_scores = [
@@ -488,9 +503,8 @@ and page number.]
         default=0.0
     )
 
-
     # --------------------------------------------------------
-    # STEP 9: Log query
+    # STEP 10: Log query
     # --------------------------------------------------------
 
     log_query(
@@ -500,14 +514,14 @@ and page number.]
         top_confidence
     )
 
-
     # --------------------------------------------------------
-    # STEP 10: Return result
+    # STEP 11: Return result
     # --------------------------------------------------------
 
     return {
         "answer": answer,
-        "exam_relevance": exam_result
+        "exam_relevance": exam_result,
+        "sources": sources
     }
 
 
@@ -535,7 +549,6 @@ if __name__ == "__main__":
             "You: "
         ).strip()
 
-
         # ----------------------------------------------------
         # EXIT
         # ----------------------------------------------------
@@ -548,7 +561,6 @@ if __name__ == "__main__":
 
             break
 
-
         # ----------------------------------------------------
         # EMPTY QUESTION
         # ----------------------------------------------------
@@ -556,15 +568,21 @@ if __name__ == "__main__":
         if not question:
             continue
 
-
         # ----------------------------------------------------
         # GENERATE ANSWER
         # ----------------------------------------------------
 
         try:
 
+            # -----------------------------------------------
+            # TEMPORARY DSML TEST
+            #
+            # DSML subject ID = 1
+            # -----------------------------------------------
+
             result = answer_question(
-                question
+                question,
+                subject_id=1
             )
 
             print(
@@ -573,6 +591,22 @@ if __name__ == "__main__":
 
             print(
                 result["answer"]
+            )
+
+            print(
+                "\nExam Relevance:\n"
+            )
+
+            print(
+                result["exam_relevance"]
+            )
+
+            print(
+                "\nSources:\n"
+            )
+
+            print(
+                result["sources"]
             )
 
             print(

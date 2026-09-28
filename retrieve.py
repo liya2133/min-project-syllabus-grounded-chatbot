@@ -11,9 +11,10 @@ Flow:
 3. Search the FAISS index.
 4. Check the similarity threshold.
 5. Get matching chunks from SQLite.
-6. If a strong heading is found, retrieve the nearby
+6. Filter results by subject when subject_id is provided.
+7. If a strong heading is found, retrieve the nearby
    chunks belonging to that section.
-7. Return chunk text + chunk ID + source + page + similarity.
+8. Return chunk text + chunk ID + source + page + similarity.
 """
 
 import sqlite3
@@ -34,8 +35,12 @@ CHUNK_IDS_PATH = "vector_store/chunk_ids.npy"
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Number of semantic results returned by FAISS
+# Number of semantic results finally used
 TOP_K = 5
+
+# Search more results internally so that after subject filtering
+# we still have enough relevant results.
+SEARCH_K = 50
 
 # Minimum similarity required for a normal semantic result
 SIMILARITY_THRESHOLD = 0.3
@@ -59,7 +64,7 @@ def load_resources():
     """
     Load the FAISS index, chunk-ID mapping,
     and Sentence Transformer model.
-    
+
     These resources are loaded only once.
     """
 
@@ -91,11 +96,7 @@ def load_resources():
 # LOAD EVERYTHING ONCE
 # ============================================================
 
-# IMPORTANT:
 # These are loaded only once when retrieve.py starts.
-#
-# This prevents the Sentence Transformer model from being
-# loaded again for every question.
 
 INDEX, CHUNK_IDS, MODEL = load_resources()
 
@@ -135,7 +136,7 @@ def embed_query(model, question):
 def search_index(
     index,
     query_vector,
-    top_k=TOP_K
+    top_k=SEARCH_K
 ):
     """
     Search the FAISS index.
@@ -160,6 +161,9 @@ def get_chunk_details(
     """
     Retrieve complete information about
     one chunk from SQLite.
+
+    subject_id is included so that results
+    can be filtered by subject.
     """
 
     cursor.execute(
@@ -170,7 +174,8 @@ def get_chunk_details(
             chunks.chunk_text,
             chunks.page_number,
             chunks.chunk_index,
-            documents.filename
+            documents.filename,
+            documents.subject_id
         FROM chunks
         JOIN documents
             ON chunks.document_id = documents.id
@@ -205,7 +210,8 @@ def get_section_neighbors(
             chunks.chunk_text,
             chunks.page_number,
             chunks.chunk_index,
-            documents.filename
+            documents.filename,
+            documents.subject_id
         FROM chunks
         JOIN documents
             ON chunks.document_id = documents.id
@@ -268,7 +274,8 @@ def make_result(
         chunk_text,
         page_number,
         chunk_index,
-        filename
+        filename,
+        subject_id
     ) = row
 
     return {
@@ -278,6 +285,7 @@ def make_result(
         "page_number": page_number,
         "chunk_index": chunk_index,
         "filename": filename,
+        "subject_id": int(subject_id),
         "similarity": float(similarity)
     }
 
@@ -286,16 +294,11 @@ def make_result(
 # RETRIEVE
 # ============================================================
 
-def retrieve(question):
+def retrieve(question, subject_id=None):
 
     # --------------------------------------------------------
     # STEP 1: Use already-loaded resources
     # --------------------------------------------------------
-
-    # We DO NOT call load_resources() here.
-    #
-    # The model, FAISS index and chunk IDs were already loaded
-    # once when this file started.
 
     index = INDEX
     chunk_ids = CHUNK_IDS
@@ -324,9 +327,14 @@ def retrieve(question):
         "(before threshold filtering):",
         [
             round(float(s), 4)
-            for s in similarities
+            for s in similarities[:TOP_K]
         ]
     )
+
+    if subject_id is not None:
+        print(
+            f"[debug] filtering results for subject_id={subject_id}"
+        )
 
     # --------------------------------------------------------
     # STEP 4: Open SQLite database
@@ -368,18 +376,37 @@ def retrieve(question):
             chunk_id
         )
 
-        if details:
+        if not details:
+            continue
 
-            result = make_result(
-                details,
-                similarity
-            )
+        # ----------------------------------------------------
+        # SUBJECT FILTER
+        # ----------------------------------------------------
 
-            result["is_neighbor"] = False
+        result_subject_id = int(
+            details[6]
+        )
 
-            semantic_results.append(
-                result
-            )
+        if (
+            subject_id is not None
+            and result_subject_id != int(subject_id)
+        ):
+            continue
+
+        result = make_result(
+            details,
+            similarity
+        )
+
+        result["is_neighbor"] = False
+
+        semantic_results.append(
+            result
+        )
+
+        # We already have enough results.
+        if len(semantic_results) >= TOP_K:
+            break
 
     # --------------------------------------------------------
     # STEP 6: Nothing relevant found
@@ -462,6 +489,16 @@ def retrieve(question):
 
         for row in neighbors:
 
+            # Make sure section neighbors are from
+            # the same subject when a subject was supplied.
+            neighbor_subject_id = int(row[6])
+
+            if (
+                subject_id is not None
+                and neighbor_subject_id != int(subject_id)
+            ):
+                continue
+
             chunk_id = int(
                 row[0]
             )
@@ -484,6 +521,9 @@ def retrieve(question):
             added_chunk_ids.add(
                 chunk_id
             )
+
+            if len(final_results) >= MAX_CONTEXT_CHUNKS:
+                break
 
     else:
 
@@ -551,11 +591,21 @@ def retrieve(question):
 if __name__ == "__main__":
 
     question = input(
-        "Ask a DSML question: "
+        "Ask a question: "
     )
 
+    # --------------------------------------------------------
+    # TEMPORARY DSML TEST
+    #
+    # DSML subject ID in your current database is 1.
+    #
+    # Later the Flask API will pass the selected subject_id
+    # automatically.
+    # --------------------------------------------------------
+
     result = retrieve(
-        question
+        question,
+        subject_id=1
     )
 
     print(
@@ -576,6 +626,11 @@ if __name__ == "__main__":
             f"| ID: {chunk['chunk_id']} "
             f"| similarity: "
             f"{chunk['similarity']:.4f}"
+        )
+
+        print(
+            f"Subject ID: "
+            f"{chunk['subject_id']}"
         )
 
         print(
